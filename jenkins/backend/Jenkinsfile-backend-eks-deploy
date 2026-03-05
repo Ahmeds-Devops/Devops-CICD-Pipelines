@@ -1,0 +1,99 @@
+pipeline {
+    agent any
+    environment {
+        envName = "dev"
+        serviceName = "demo-datadecoding"
+        parameterName = "/demo/data/decoding/dev/env"
+        port = "9000"
+        REGION = "ap-south-1"
+        clusterName = "demoEKSCluster"
+        namespace = "dev-demo"
+        AccountId = "123456789101"
+        ECR_REPO_NAME = "demo-decoding-repo-dev"
+        EKS_ASSUME_ROLE_ARN = "arn:aws:iam::123456789101:role/eks-access-jenkins-role"
+    }
+
+    stages {
+        stage('Clone Repository') {
+            steps {
+                git branch: 'main', 
+                    credentialsId: 'GitHub_demo', 
+                    url: 'https://github.com/demo/demo-data-decoding.git'
+            }
+        }
+
+        stage('Fetch Environment Parameters') {
+            steps {
+                script {
+                    sh """
+                        aws ssm get-parameter --region ${REGION} --name ${parameterName} --with-decryption | jq -r '.Parameter.Value' > .env
+                    """
+                    sh """
+                        aws ssm get-parameter --region ${REGION} --name "/demo/data/decoding/dev/Dockerfile" --with-decryption | jq -r '.Parameter.Value' > Dockerfile
+                    """
+                    sh """
+                        aws ssm get-parameter --region ${REGION} --name "/demo/data/decoding/dev/manifestFile" --with-decryption | jq -r '.Parameter.Value' > demo-data-decoding-service-dev.yaml
+                    """
+                }
+            }
+        }
+
+        stage('Build Docker Images') {
+            steps {
+                script {
+                    sh '''
+                        COMMIT_HASH=$(git rev-parse --short HEAD)
+                        docker build -t ${ECR_REPO_NAME} .
+                        aws ecr get-login-password --region ${REGION} | docker login --username AWS --password-stdin ${AccountId}.dkr.ecr.${REGION}.amazonaws.com
+                        docker tag ${ECR_REPO_NAME}:latest "${AccountId}.dkr.ecr.${REGION}.amazonaws.com/${ECR_REPO_NAME}:${COMMIT_HASH}"
+                        docker tag ${ECR_REPO_NAME}:latest "${AccountId}.dkr.ecr.${REGION}.amazonaws.com/${ECR_REPO_NAME}:latest"
+                        docker push "${AccountId}.dkr.ecr.${REGION}.amazonaws.com/${ECR_REPO_NAME}:${COMMIT_HASH}"
+                        docker push "${AccountId}.dkr.ecr.${REGION}.amazonaws.com/${ECR_REPO_NAME}:latest"
+                    '''
+                }
+            }
+        }
+
+        stage('Deploy to EKS') {
+            steps {
+                script {
+                    sh '''
+                        echo "------ Getting temporary credentials ------"
+                        CREDS=$(aws sts assume-role --role-arn ${EKS_ASSUME_ROLE_ARN} --role-session-name Jenkins --duration-seconds 900)
+                        export AWS_ACCESS_KEY_ID="$(echo ${CREDS} | jq -r '.Credentials.AccessKeyId')"
+                        export AWS_SECRET_ACCESS_KEY="$(echo ${CREDS} | jq -r '.Credentials.SecretAccessKey')"
+                        export AWS_SESSION_TOKEN="$(echo ${CREDS} | jq -r '.Credentials.SessionToken')"
+                        export AWS_EXPIRATION=$(echo ${CREDS} | jq -r '.Credentials.Expiration')
+                        
+                        aws eks update-kubeconfig --name ${clusterName} --region ${REGION}
+                        kubectl get pods -n ${namespace}
+
+                        echo "Checking if deployment exists..."
+                        if kubectl get deploy demo-data-decoding-dev -n ${namespace}; then
+                            echo "Deployment exists. Restarting rollout..."
+                            kubectl rollout restart deployment demo-data-decoding-dev -n ${namespace}
+                            echo "Checking rollout status..."
+                            if kubectl rollout status deployment demo-data-decoding-dev -n ${namespace}; then
+                                echo "Deployment successful!"
+                            else
+                                echo "Deployment failed! Rolling back..."
+                                kubectl rollout undo deployment demo-data-decoding-dev -n ${namespace}
+                                exit 1
+                            fi
+                        else
+                            echo "Deployment does not exist. Applying YAML..."
+                            kubectl apply -f demo-data-decoding-service-dev.yaml -n ${namespace}
+                            echo "Checking rollout status..."
+                            if kubectl rollout status deployment demo-data-decoding-dev -n ${namespace}; then
+                                echo "Deployment successful!"
+                            else
+                                echo "Deployment failed! Exiting..."
+                                exit 1
+                            fi
+                        fi
+                    '''
+                }
+            }
+        }
+    }
+}
