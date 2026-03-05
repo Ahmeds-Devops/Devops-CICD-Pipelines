@@ -1,0 +1,68 @@
+pipeline {
+    agent any
+
+    environment {
+        envName      = "dev"
+        parameterName = "/demo/ui/dev/env"
+    }
+
+    stages {
+
+        stage('Clone Repository') {
+            steps {
+                git branch: 'dev',
+                    credentialsId: 'GitHub_demo',
+                    url: 'https://github.com/demo/demo-ui.git'
+            }
+        }
+
+        stage('Fetch env parameter') {
+            steps {
+                // Fetch environment variables securely from AWS SSM Parameter Store
+                sh """
+                    aws ssm get-parameter \
+                        --region ap-south-1 \
+                        --name ${parameterName} \
+                        --with-decryption \
+                    | jq -r '.Parameter.Value' > .env.dev
+                """
+            }
+        }
+
+        stage('Install dependencies') {
+            steps {
+                sh 'npm install --cache /var/lib/jenkins/workspace/node_cache'
+                sh 'npm i --save-dev html-webpack-plugin'
+            }
+        }
+
+        stage('Build') {
+            steps {
+                sh 'npm run build-dev || true'
+            }
+        }
+
+        stage('Remove old UI files') {
+            steps {
+                // Clean S3 bucket before uploading new build
+                sh 'aws s3 rm s3://devops-demo-dev/ --recursive'
+            }
+        }
+
+        stage('Upload latest UI files') {
+            steps {
+                // Sync new build artifacts to S3
+                sh 'cd build && aws s3 sync . s3://devops-demo-dev/'
+            }
+        }
+    }
+
+    post {
+        success {
+            echo '✅ Frontend deployed successfully to S3!'
+        }
+        failure {
+            echo '❌ Deployment failed. Please check the logs.'
+        }
+    }
+}
