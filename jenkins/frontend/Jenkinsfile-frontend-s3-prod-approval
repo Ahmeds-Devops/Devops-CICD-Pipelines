@@ -1,0 +1,78 @@
+pipeline {
+    agent any
+
+    environment {
+        envName      = "prod"
+        parameterName = "/demo/ui/prod/env"
+    }
+
+    stages {
+
+        stage('Clone Repository') {
+            steps {
+                git branch: 'prod',
+                    credentialsId: 'GitHub_demo',
+                    url: 'https://github.com/demo/demo-ui.git'
+            }
+        }
+
+        stage('Fetch env parameter') {
+            steps {
+                // Fetch environment variables securely from AWS SSM Parameter Store
+                sh """
+                    aws ssm get-parameter \
+                        --region ap-south-1 \
+                        --name ${parameterName} \
+                        --with-decryption \
+                    | jq -r '.Parameter.Value' > .env.prod
+                """
+            }
+        }
+
+        stage('Install dependencies') {
+            steps {
+                sh 'npm install --cache /var/lib/jenkins/workspace/node_cache'
+                sh 'npm i --save-prod html-webpack-plugin'
+            }
+        }
+
+        stage('Build') {
+            steps {
+                sh 'npm run build-prod || true'
+            }
+        }
+
+        stage('Approval for PROD Deploy') {
+            agent none
+            steps {
+                script {
+                    input message: "Do you want to deploy to PROD?",
+                          ok: "Deploy Now"
+                }
+            }
+        }
+
+        stage('Remove old UI files') {
+            steps {
+                // Clean S3 bucket before uploading new build
+                sh 'aws s3 rm s3://devops-demo-prod/ --recursive'
+            }
+        }
+
+        stage('Upload latest UI files') {
+            steps {
+                // Sync new build artifacts to S3
+                sh 'cd build && aws s3 sync . s3://devops-demo-prod/'
+            }
+        }
+    }
+
+    post {
+        success {
+            echo '✅ Frontend deployed successfully to S3!'
+        }
+        failure {
+            echo '❌ Deployment failed. Please check the logs.'
+        }
+    }
+}
